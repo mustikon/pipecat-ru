@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from pathlib import Path
 
 import numpy as np
@@ -100,6 +101,19 @@ def test_run_tts_benchmark(tmp_path: Path) -> None:
     assert row.chunks == 2 and row.audio_s == 0.2
     assert row.first_audio_ms <= row.total_ms
     assert (tmp_path / "001.wav").exists()
+
+
+def test_run_tts_benchmark_streaming() -> None:
+    def stream(text: str) -> Iterator[tuple[np.ndarray, int]]:
+        for _ in range(3):
+            yield np.zeros(2400, dtype=np.float32), 24000
+
+    summary = bench.run_tts_benchmark(
+        lambda text: (np.zeros(1), 24000), ["Хорошо, сейчас посмотрю."], warmup=0, stream=stream
+    )
+    row = summary.rows[0]
+    assert row.audio_s == 0.3
+    assert 0 < row.first_audio_ms <= row.total_ms
 
 
 def test_cli_stt(

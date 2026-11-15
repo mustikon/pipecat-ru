@@ -6,6 +6,17 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- Fast streaming generation for `Qwen3TTSService` (12 Hz models on CUDA, on by default;
+  `fast=False` turns it off). The talker and code predictor run on static KV caches, a
+  whole codec frame (15 code-predictor steps, one talker step and sampling) is replayed
+  as one CUDA graph, and audio is decoded and streamed while later frames are generated.
+  On an RTX 5090, the 1.7B model reaches first audio in about 85 ms with RTF about 0.25,
+  against RTF 1.4 and 3-10 s through plain `qwen-tts`. Needs only torch and `qwen-tts`.
+  New options: `first_chunk_frames`, `chunk_frames`, `max_seq_len`.
+- `RussianLocalTTSService.synthesize_stream()`: a hook for services that produce audio
+  in pieces. The default yields `synthesize()` as one chunk.
+
 ## [0.1.0] - 2026-11-15
 
 ### Added

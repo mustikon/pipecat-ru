@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import threading
 import time
 from abc import abstractmethod
-from collections.abc import AsyncGenerator, AsyncIterator
-from typing import Any
+from collections.abc import AsyncGenerator, AsyncIterator, Iterator
+from typing import Any, TypeVar
 
 from loguru import logger
 from pipecat.frames.frames import ErrorFrame, Frame, StartFrame
@@ -22,6 +24,55 @@ from pipecat_ru.text.splitter import RussianTextAggregator, SplitterConfig
 # Audio is handed to Pipecat in pieces of this length, so playback can start
 # before a long chunk has been copied through the pipeline.
 _PUSH_SECS = 0.2
+
+
+_T = TypeVar("_T")
+_WORKERS: set[asyncio.Future[None]] = set()
+
+
+async def iterate_in_thread(iterator: Iterator[_T]) -> AsyncGenerator[_T, None]:
+    """Run a blocking iterator in a worker thread and yield its items.
+
+    When the consumer stops early (an interruption cancels it), the worker stops
+    after the item it is producing and closes the iterator in its own thread, so a
+    generator's ``finally``/``with`` blocks run there.
+    """
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+    stop = threading.Event()
+
+    def put(kind: str, value: Any) -> None:
+        with contextlib.suppress(RuntimeError):  # the event loop is already closed
+            loop.call_soon_threadsafe(queue.put_nowait, (kind, value))
+
+    def work() -> None:
+        try:
+            for item in iterator:
+                if stop.is_set():
+                    break
+                put("item", item)
+        except BaseException as e:
+            put("error", e)
+        finally:
+            close = getattr(iterator, "close", None)
+            if close is not None:
+                close()
+            put("done", None)
+
+    worker = asyncio.ensure_future(asyncio.to_thread(work))
+    _WORKERS.add(worker)
+    worker.add_done_callback(_WORKERS.discard)
+    try:
+        while True:
+            kind, value = await queue.get()
+            if kind == "item":
+                yield value
+            elif kind == "error":
+                raise value
+            else:
+                return
+    finally:
+        stop.set()
 
 
 class _Default:
@@ -44,7 +95,8 @@ class RussianLocalTTSService(TTSService):
       text transforms. Pass ``normalizer=None`` to switch normalization off, or
       your own normalizer (custom lexicon, stress marks).
 
-    Subclasses implement :meth:`load_model` and :meth:`synthesize`.
+    Subclasses implement :meth:`load_model` and :meth:`synthesize`; a model that can
+    produce audio incrementally also overrides :meth:`synthesize_stream`.
     """
 
     def __init__(
@@ -91,6 +143,13 @@ class RussianLocalTTSService(TTSService):
     def synthesize(self, text: str) -> tuple[Any, int]:
         """Synthesize ``text`` (runs in a worker thread): (float samples, sample rate)."""
 
+    def synthesize_stream(self, text: str) -> Iterator[tuple[Any, int]]:
+        """Yield ``(float samples, sample rate)`` chunks for ``text`` as they are ready.
+
+        Runs in a worker thread. The default yields :meth:`synthesize` as one chunk.
+        """
+        yield self.synthesize(text)
+
     # ------------------------------------------------------------------ Pipecat API
 
     def can_generate_metrics(self) -> bool:
@@ -115,27 +174,41 @@ class RussianLocalTTSService(TTSService):
     @traced_tts
     async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
         """Synthesize one chunk of text and stream it out as audio frames."""
+        chunks = iterate_in_thread(self.synthesize_stream(text))
         try:
             await self.ensure_loaded()
             await self.start_tts_usage_metrics(text)
-            samples, sample_rate = await asyncio.to_thread(self.synthesize, text)
-            pcm = float_to_pcm16(samples)
-            if not pcm:
+            first = await anext(chunks, None)
+            if first is None:
                 logger.warning(f"{self}: no audio for [{text}]")
                 return
+            sample_rate = int(first[1])
             piece = max(2, int(sample_rate * _PUSH_SECS) * 2)
+            sent = 0
 
             async def pieces() -> AsyncIterator[bytes]:
-                for chunk in chunk_bytes(pcm, piece):
-                    yield chunk
+                nonlocal sent
+                item: tuple[Any, int] | None = first
+                while item is not None:
+                    samples, rate = item
+                    if int(rate) != sample_rate:
+                        raise ValueError(f"sample rate changed mid-utterance: {rate}")
+                    pcm = float_to_pcm16(samples)
+                    sent += len(pcm)
+                    for chunk in chunk_bytes(pcm, piece):
+                        yield chunk
+                    item = await anext(chunks, None)
 
             async for frame in self._stream_audio_frames_from_iterator(
                 pieces(), in_sample_rate=sample_rate, context_id=context_id
             ):
                 await self.stop_ttfb_metrics()
                 yield frame
+            if not sent:
+                logger.warning(f"{self}: no audio for [{text}]")
         except Exception as e:
             logger.exception(f"{self}: synthesis failed for [{text}]")
             yield ErrorFrame(error=f"{type(self).__name__} synthesis failed: {e}")
         finally:
+            await chunks.aclose()
             await self.stop_ttfb_metrics()

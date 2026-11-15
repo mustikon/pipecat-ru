@@ -129,6 +129,37 @@ def test_qwen3_tts_roundtrip(gigaam_transcriber) -> None:  # type: ignore[no-unt
     assert wer(PHRASE, text) <= 0.35
 
 
+def test_qwen3_tts_fast_streaming(gigaam_transcriber) -> None:  # type: ignore[no-untyped-def]
+    need_cuda()
+    need("qwen_tts")
+    from pipecat_ru.text import RussianTextNormalizer, RussianTextSplitter
+    from pipecat_ru.tts.qwen3 import Qwen3TTSService
+
+    tts = Qwen3TTSService(speaker="Ryan", fast=True)
+    tts.load_model()  # also captures the CUDA graph
+    normalizer = RussianTextNormalizer()
+    first = normalizer(RussianTextSplitter().split(PHRASE)[0])
+    t0 = time.perf_counter()
+    chunks = []
+    first_audio = None
+    sr = 24000
+    for samples, rate in tts.synthesize_stream(first):
+        first_audio = first_audio or time.perf_counter() - t0
+        chunks.append(samples)
+        sr = rate
+    assert first_audio is not None
+    t0 = time.perf_counter()
+    full = np.concatenate([c for c, _ in tts.synthesize_stream(normalizer(PHRASE))])
+    rtf = (time.perf_counter() - t0) / (len(full) / sr)
+    text = gigaam_transcriber.transcribe(resample_linear(full, sr, 16000))
+    print(
+        f"\nQwen3-TTS fast: first audio {first_audio * 1000:.0f} ms, RTF {rtf:.2f}; heard {text!r}"
+    )
+    assert first_audio < 0.5
+    assert rtf < 1.0
+    assert wer(PHRASE, text) <= 0.35
+
+
 def test_ruaccent_stress_marks() -> None:
     need("ruaccent")
     from pipecat_ru.text import StressMarker

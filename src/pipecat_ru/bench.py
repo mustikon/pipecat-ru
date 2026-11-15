@@ -11,8 +11,9 @@ STT (GigaAM): a folder of recorded phrases, each with its reference text::
 
 reports WER, CER and per-phrase latency (p50/p90/max) and real-time factor.
 
-TTS (Qwen3-TTS or Silero): time to first audio (normalize + split + synthesize the
-first chunk), total synthesis time and real-time factor::
+TTS (Qwen3-TTS or Silero): time to first audio (normalize + split + the first audio
+piece of the first chunk; services that stream audio yield it before the chunk is done),
+total synthesis time and real-time factor::
 
     pipecat-ru-bench tts --engine qwen3 --ref-audio me.wav --ref-text "..." --save-dir out/
     pipecat-ru-bench tts --engine silero --texts phrases.txt
@@ -234,6 +235,7 @@ def run_stt_benchmark(
 # --------------------------------------------------------------------- TTS
 
 Synthesizer = Callable[[str], tuple[Any, int]]
+StreamSynthesizer = Callable[[str], Iterable[tuple[Any, int]]]
 
 
 @dataclass
@@ -274,9 +276,19 @@ def run_tts_benchmark(
     normalizer: RussianTextNormalizer | None = None,
     warmup: int = 1,
     save_dir: Path | None = None,
+    stream: StreamSynthesizer | None = None,
 ) -> TtsSummary:
-    """Synthesize each text chunk by chunk, as the Pipecat service would."""
+    """Synthesize each text chunk by chunk, as the Pipecat service would.
+
+    With ``stream`` (e.g. a service's ``synthesize_stream``), audio is taken piece by
+    piece and time to first audio is measured at the first piece.
+    """
     normalizer = normalizer if normalizer is not None else RussianTextNormalizer()
+    if stream is None:
+
+        def stream(text: str) -> Iterable[tuple[Any, int]]:
+            yield synthesize(text)
+
     texts = list(texts)
     for text in texts[:warmup]:
         synthesize(normalizer(text))
@@ -287,11 +299,12 @@ def run_tts_benchmark(
         first_ms = 0.0
         audio_parts: list[FloatArray] = []
         sample_rate = 0
-        for n, chunk in enumerate(chunks):
-            samples, sample_rate = synthesize(normalizer(chunk))
-            audio_parts.append(_to_float_array(samples))
-            if n == 0:
-                first_ms = (time.perf_counter() - t0) * 1000
+        for chunk in chunks:
+            for samples, rate in stream(normalizer(chunk)):
+                sample_rate = rate
+                audio_parts.append(_to_float_array(samples))
+                if not first_ms:
+                    first_ms = (time.perf_counter() - t0) * 1000
         total = time.perf_counter() - t0
         audio = np.concatenate(audio_parts) if audio_parts else np.zeros(0, np.float32)
         audio_s = len(audio) / sample_rate if sample_rate else 0.0
@@ -408,6 +421,7 @@ def _cmd_tts(args: argparse.Namespace) -> int:
         normalizer=service.normalizer or RussianTextNormalizer(),
         warmup=args.warmup,
         save_dir=Path(args.save_dir) if args.save_dir else None,
+        stream=service.synthesize_stream,
     )
     if args.csv:
         _write_csv(Path(args.csv), summary.rows)

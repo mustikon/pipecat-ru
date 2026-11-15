@@ -95,8 +95,9 @@ tokenizer at a pinned commit; no remote code runs. Choose the source explicitly 
 
 ### TTS: Qwen3-TTS and Silero
 
-Both services synthesize one text chunk per call in a worker thread, and stream the audio out
-in 200 ms frames.
+Both services synthesize in a worker thread and stream the audio out in 200 ms frames. Silero
+synthesizes one text chunk per call. Qwen3-TTS on a CUDA GPU streams audio as it is generated
+(see below).
 
 * **Qwen3-TTS voice clone:** `Qwen3TTSService(ref_audio=..., ref_text=...)` with the 1.7B or
   0.6B *Base* model. The clone prompt is built once at startup.
@@ -105,8 +106,17 @@ in 200 ms frames.
 * **Silero:** `SileroTTSService(speaker="xenia")`, with speakers `aidar`, `baya`, `kseniya`,
   `xenia` and `eugene`. It runs on the CPU. Silero reads `+` stress marks natively.
 
-The `qwen-tts` package does not expose incremental audio yet. Time to first audio is therefore
-set by the length of the first chunk, and keeping that chunk short is the splitter's job.
+**Fast Qwen3-TTS (default on CUDA).** Through `qwen-tts` and Hugging Face `generate()`,
+Qwen3-TTS is slower than real time even on an RTX 5090. Each 80 ms codec frame takes one talker
+step plus 15 small code-predictor steps, and the loop is bound by kernel launches. So on a CUDA
+device `Qwen3TTSService` uses its own generator. It keeps the `qwen-tts` weights and prompt
+building, and runs the talker and code predictor on fixed-size KV caches. One whole frame,
+sampling included, is captured as a single CUDA graph, and audio is decoded and sent while later
+frames are generated. It needs only torch and `qwen-tts`: no Triton, flash-attn or vLLM. Options:
+`first_chunk_frames` (default 3, i.e. 240 ms of audio in the first chunk), `chunk_frames` (8),
+`max_seq_len` (2048 tokens: prompt plus about 2.5 minutes of audio). `fast=False` goes back to
+plain `qwen-tts` calls. Sampling follows `qwen-tts` (top-k, temperature, repetition penalty),
+but the random draws differ, so the same seed gives different audio than `qwen-tts`.
 
 Both services install the Russian splitter and normalizer by default:
 `normalizer=None` / `splitter=None` turn them off, or pass your own.
@@ -190,13 +200,18 @@ Measured on an RTX 5090 (32 GB) with Windows 11, torch 2.11+cu128 and bf16. Numb
 | Normalizer (no stress) | 0.25 ms per sentence |
 | ruaccent stress (`turbo3.1`, CPU) | 12–60 ms per chunk |
 | Silero v5 (CPU), first chunk | **60–140 ms**; a 10 s reply in 0.25 s |
-| Qwen3-TTS 1.7B (`qwen-tts` 0.1.1, sdpa) | **RTF ≈ 1.4**: 3 s for 2 s of audio; first audio 4–10 s |
+| Qwen3-TTS 1.7B, fast path (CustomVoice and Base clone) | first audio **85–88 ms** (worst 117 ms), **RTF 0.24–0.26** |
+| Qwen3-TTS 0.6B CustomVoice, fast path | first audio **81 ms**, RTF 0.22–0.23 |
+| Qwen3-TTS 1.7B through plain `qwen-tts` 0.1.1 (`fast=False`) | RTF ≈ 1.4; first audio 3–10 s (whole chunk) |
 
-Qwen3-TTS through the official `qwen-tts` package is **slower than real time** on this GPU.
-During generation the GPU is only about 8% busy: the bottleneck is per-step Python overhead in
-the generation loop. The 0.6B model is no faster. For live replies, use Silero (or another fast
-voice) for now. Qwen3-TTS becomes viable with a faster runtime, such as vLLM-Omni or a CUDA-graph
-build of the decoder; that is on the roadmap.
+Qwen3-TTS numbers are medians over 5–8 runs of a 24-character clause («Хорошо, сейчас
+посмотрю,») and an 85-character sentence. First audio is the time from the text reaching
+`Qwen3TTSService.run_tts` to its first audio frame, measured in the Pipecat service with sdpa
+attention and no flash-attn. The fast path speeds up the 1.7B model about 5.7×. Startup (loading
+plus CUDA-graph capture and warmup) takes 9–13 s, and the 1.7B model uses about 4.2 GB of GPU
+memory. Through plain `qwen-tts`, Hugging Face `generate()` keeps the GPU only about 8% busy and
+runs slower than real time. All fast-path outputs transcribe back correctly with GigaAM. Their
+lengths vary from run to run about as much as plain `qwen-tts` outputs do (sampling is on).
 
 ruaccent resolves common homographs («повесил зам+ок», «насыпь мук+у»). It can still pick the
 wrong reading in ambiguous sentences («замок на воротах сломан»). Stress is added per TTS chunk,
@@ -243,6 +258,6 @@ Alpha, built for a personal assistant and published in case it helps others. Pla
 
 * a streaming partials STT (T-one or NVIDIA Nemotron streaming ASR), so backchannels and
   interruptions can be judged before the utterance ends;
-* a real-time Qwen3-TTS runtime (vLLM-Omni or CUDA graphs) with incremental audio.
+* streaming text input for Qwen3-TTS (start speaking while the LLM sentence is still arriving).
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) and [CHANGELOG.md](CHANGELOG.md).
