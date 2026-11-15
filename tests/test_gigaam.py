@@ -110,7 +110,13 @@ async def test_service_loads_model_lazily(monkeypatch: object) -> None:
     assert calls == [
         (
             "v3_e2e_rnnt",
-            {"device": "cuda", "fp16_encoder": False, "use_flash": False, "download_root": None},
+            {
+                "source": "auto",
+                "device": "cuda",
+                "fp16_encoder": False,
+                "use_flash": False,
+                "download_root": None,
+            },
         )
     ]
 
@@ -120,3 +126,111 @@ def test_service_properties() -> None:
     assert stt.wants_wav_segments is False
     assert stt.segment_sample_rate == 16000
     assert stt.language_to_service_language(Language.EN) == "ru"
+
+
+def _fake_gigaam_module(monkeypatch: object, load_model: object) -> None:
+    import sys
+    import types
+
+    module = types.ModuleType("gigaam")
+    module.load_model = load_model  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "gigaam", module)  # type: ignore[attr-defined]
+
+
+def test_loader_falls_back_to_hugging_face_when_download_fails(monkeypatch: object) -> None:
+    import pipecat_ru.stt.gigaam as mod
+
+    def broken(name: str, **kwargs: object) -> object:
+        raise RuntimeError("Download failed: certificate has expired")
+
+    _fake_gigaam_module(monkeypatch, broken)
+    seen: list[tuple[str, object, object]] = []
+
+    def fake_hf(name: str, *, device: object, revision: object, **kwargs: object) -> str:
+        seen.append((name, device, revision))
+        return "hf-model"
+
+    monkeypatch.setattr(mod, "_load_from_hf", fake_hf)  # type: ignore[attr-defined]
+    assert mod.load_gigaam_model("v3_e2e_ctc", device="cuda") == "hf-model"
+    assert seen == [("v3_e2e_ctc", "cuda", None)]
+
+
+def test_loader_package_source_does_not_fall_back(monkeypatch: object) -> None:
+    import pytest
+
+    import pipecat_ru.stt.gigaam as mod
+
+    def broken(name: str, **kwargs: object) -> object:
+        raise RuntimeError("Download failed")
+
+    _fake_gigaam_module(monkeypatch, broken)
+    with pytest.raises(RuntimeError, match="Download failed"):
+        mod.load_gigaam_model(source="package")
+
+
+def test_loader_uses_package_when_it_works(monkeypatch: object) -> None:
+    import pipecat_ru.stt.gigaam as mod
+
+    calls: list[dict[str, object]] = []
+
+    def ok(name: str, **kwargs: object) -> str:
+        calls.append({"name": name, **kwargs})
+        return "pkg-model"
+
+    _fake_gigaam_module(monkeypatch, ok)
+    assert mod.load_gigaam_model(device="cpu") == "pkg-model"
+    assert calls == [
+        {"name": "v3_e2e_rnnt", "fp16_encoder": True, "use_flash": False, "device": "cpu"}
+    ]
+
+
+def test_loader_rejects_unknown_source_and_unpinned_model() -> None:
+    import pytest
+
+    import pipecat_ru.stt.gigaam as mod
+
+    with pytest.raises(ValueError, match="source"):
+        mod.load_gigaam_model(source="cdn")
+    with pytest.raises(ValueError, match="pinned"):
+        mod._load_from_hf("v9_future", device="cpu", revision=None)
+
+
+def test_hf_style_model_enables_tensor_path() -> None:
+    class HFStyle(FakeGigaAM):
+        _device = "cpu"
+        head = object()
+        decoding = object()
+
+        def forward(self, *args: object) -> None:
+            raise TypeError("not called in this test")
+
+    assert GigaAMTranscriber(HFStyle()).fast_path is True
+
+
+def test_retarget_maps_hf_config_onto_package_classes() -> None:
+    import types
+
+    from pipecat_ru.stt.gigaam import _retarget
+
+    enc = types.ModuleType("gigaam.encoder")
+    enc.ConformerEncoder = object  # type: ignore[attr-defined]
+    dec = types.ModuleType("gigaam.decoding")
+    dec.RNNTGreedyDecoding = object  # type: ignore[attr-defined]
+    cfg = {
+        "encoder": {"_target_": "modeling_gigaam.ConformerEncoder", "n_layers": 16},
+        "decoding": {"_target_": "modeling_gigaam.RNNTGreedyDecoding"},
+        "other": [{"_target_": "keep.me"}],
+    }
+    _retarget(cfg, {"gigaam.encoder": enc, "gigaam.decoding": dec})
+    assert cfg["encoder"]["_target_"] == "gigaam.encoder.ConformerEncoder"
+    assert cfg["decoding"]["_target_"] == "gigaam.decoding.RNNTGreedyDecoding"
+    assert cfg["other"][0]["_target_"] == "keep.me"
+
+
+def test_retarget_rejects_unknown_class() -> None:
+    import pytest
+
+    from pipecat_ru.stt.gigaam import _retarget
+
+    with pytest.raises(ValueError, match="NewHead"):
+        _retarget({"_target_": "modeling_gigaam.NewHead"}, {})

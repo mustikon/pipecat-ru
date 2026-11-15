@@ -31,11 +31,13 @@ on your own GPU.
 ```bash
 pip install pipecat-ru                       # text tools + turn strategy (no torch)
 pip install "pipecat-ru[gigaam,qwen,silero,accent]"
-pip install "gigaam @ git+https://github.com/salute-developers/GigaAM"
+pip install --no-deps "gigaam @ git+https://github.com/salute-developers/GigaAM"
 ```
 
 GigaAM v3 is not on PyPI (the `gigaam` name there is an old v1 build), so it is installed
-from GitHub. GigaAM also needs `ffmpeg` on `PATH` for its file-based API. This package feeds
+from GitHub, with `--no-deps`: GigaAM pins `onnxruntime==1.23.*`, which conflicts with
+pipecat-ai's `onnxruntime>=1.24.3`, and it only needs onnxruntime for ONNX export. The
+`gigaam` extra installs the rest of its dependencies. GigaAM also needs `ffmpeg` on `PATH` for its file-based API. This package feeds
 it tensors directly, so `ffmpeg` is only used as a fallback.
 
 **RTX 50xx (Blackwell) on Windows:** install a CUDA 12.8+ build of PyTorch *before* the extras,
@@ -84,6 +86,12 @@ and each one is transcribed in a worker thread. The default model is `v3_e2e_rnn
 punctuation and normalized text. `v3_e2e_ctc` is faster. Utterances over 24 s are split at
 quiet points, because GigaAM's short-form API stops at 25 s. You can pass a loaded `model=` to
 share one model between services. Otherwise the model loads when the pipeline starts.
+
+Checkpoints normally come from SberDevices' CDN through the `gigaam` package. If that download
+fails (in November 2026 the CDN served an expired TLS certificate), the loader falls back to the
+official Hugging Face mirror `ai-sage/GigaAM-v3`. It fetches only the weights, the config and the
+tokenizer at a pinned commit; no remote code runs. Choose the source explicitly with
+`GigaAMSTTService(source="package" | "hf" | "auto")`.
 
 ### TTS: Qwen3-TTS and Silero
 
@@ -171,6 +179,29 @@ pipecat-ru-bench tts --engine silero
 STT reports WER and CER (numbers are spelled out on both sides before scoring), latency p50,
 p90 and max, and the real-time factor. TTS reports time to first audio and the RTF.
 
+## Measured performance
+
+Measured on an RTX 5090 (32 GB) with Windows 11, torch 2.11+cu128 and bf16. Numbers come from
+`tests/test_gpu_integration.py` and `examples/make_samples.py`.
+
+| Step | Result |
+|---|---|
+| GigaAM v3 e2e-RNNT, 4 s phrase | **66 ms**, transcript exact |
+| Normalizer (no stress) | 0.25 ms per sentence |
+| ruaccent stress (`turbo3.1`, CPU) | 12–60 ms per chunk |
+| Silero v5 (CPU), first chunk | **60–140 ms**; a 10 s reply in 0.25 s |
+| Qwen3-TTS 1.7B (`qwen-tts` 0.1.1, sdpa) | **RTF ≈ 1.4**: 3 s for 2 s of audio; first audio 4–10 s |
+
+Qwen3-TTS through the official `qwen-tts` package is **slower than real time** on this GPU.
+During generation the GPU is only about 8% busy: the bottleneck is per-step Python overhead in
+the generation loop. The 0.6B model is no faster. For live replies, use Silero (or another fast
+voice) for now. Qwen3-TTS becomes viable with a faster runtime, such as vLLM-Omni or a CUDA-graph
+build of the decoder; that is on the roadmap.
+
+ruaccent resolves common homographs («повесил зам+ок», «насыпь мук+у»). It can still pick the
+wrong reading in ambiguous sentences («замок на воротах сломан»). Stress is added per TTS chunk,
+so the model sees less context than in the whole reply.
+
 ## Model licences
 
 The code in this repository is Apache-2.0. **The models have their own licences**, and you
@@ -199,7 +230,7 @@ Optional real-model tests for a CUDA machine (written for an RTX 5090 on Windows
 
 ```powershell
 uv sync --all-extras
-uv pip install "gigaam @ git+https://github.com/salute-developers/GigaAM"
+uv pip install --no-deps "gigaam @ git+https://github.com/salute-developers/GigaAM"
 $env:PIPECAT_RU_GPU_TESTS = "1"
 $env:PIPECAT_RU_REF_AUDIO = "C:\voice\me.wav"         # optional, for voice cloning
 $env:PIPECAT_RU_REF_TEXT  = "Текст этой записи."
@@ -212,6 +243,6 @@ Alpha, built for a personal assistant and published in case it helps others. Pla
 
 * a streaming partials STT (T-one or NVIDIA Nemotron streaming ASR), so backchannels and
   interruptions can be judged before the utterance ends;
-* incremental Qwen3-TTS audio once `qwen-tts` exposes it.
+* a real-time Qwen3-TTS runtime (vLLM-Omni or CUDA graphs) with incremental audio.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) and [CHANGELOG.md](CHANGELOG.md).

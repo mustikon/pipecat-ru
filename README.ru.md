@@ -30,10 +30,12 @@
 ```bash
 pip install pipecat-ru                       # текстовые инструменты и стратегия реплик (без torch)
 pip install "pipecat-ru[gigaam,qwen,silero,accent]"
-pip install "gigaam @ git+https://github.com/salute-developers/GigaAM"
+pip install --no-deps "gigaam @ git+https://github.com/salute-developers/GigaAM"
 ```
 
-GigaAM v3 нет на PyPI (пакет `gigaam` там — старая v1), поэтому он ставится с GitHub. Файловому
+GigaAM v3 нет на PyPI (пакет `gigaam` там — старая v1), поэтому он ставится с GitHub и с
+`--no-deps`: GigaAM фиксирует `onnxruntime==1.23.*`, а pipecat-ai требует `onnxruntime>=1.24.3`.
+onnxruntime нужен GigaAM только для экспорта в ONNX, остальные зависимости ставит extra `gigaam`. Файловому
 API GigaAM нужен `ffmpeg` в `PATH`. Этот пакет передаёт модели тензоры напрямую, так что `ffmpeg`
 нужен только как запасной путь.
 
@@ -83,6 +85,11 @@ pipeline = Pipeline([transport.input(), stt, aggregators.user(), llm, tts,
 нормализацией. `v3_e2e_ctc` быстрее. Фразы длиннее 24 с режутся по паузам, потому что короткий
 API GigaAM ограничен 25 с. Можно передать готовую модель через `model=` и делить её между
 сервисами. Иначе модель загружается при старте пайплайна.
+
+Обычно веса скачиваются с CDN SberDevices через пакет `gigaam`. Если загрузка не удалась (в ноябре
+2026 у CDN был просроченный TLS-сертификат), загрузчик берёт официальное зеркало на Hugging Face,
+`ai-sage/GigaAM-v3`. Скачиваются только веса, конфиг и токенизатор с закреплённого коммита, чужой
+код не запускается. Источник можно выбрать явно: `GigaAMSTTService(source="package" | "hf" | "auto")`.
 
 ### TTS: Qwen3-TTS и Silero
 
@@ -169,6 +176,29 @@ pipecat-ru-bench tts --engine silero
 Для STT выводятся WER и CER (числа перед подсчётом прописываются с обеих сторон), задержка p50,
 p90 и max и RTF. Для TTS — время до первого звука и RTF.
 
+## Измеренная производительность
+
+Замеры на RTX 5090 (32 ГБ), Windows 11, torch 2.11+cu128, bf16. Цифры взяты из
+`tests/test_gpu_integration.py` и `examples/make_samples.py`.
+
+| Шаг | Результат |
+|---|---|
+| GigaAM v3 e2e-RNNT, фраза 4 с | **66 мс**, расшифровка без ошибок |
+| Нормализатор (без ударений) | 0,25 мс на предложение |
+| Ударения ruaccent (`turbo3.1`, CPU) | 12–60 мс на кусок |
+| Silero v5 (CPU), первый кусок | **60–140 мс**; ответ на 10 с готов за 0,25 с |
+| Qwen3-TTS 1.7B (`qwen-tts` 0.1.1, sdpa) | **RTF ≈ 1,4**: 3 с на 2 с звука; первый звук через 4–10 с |
+
+Через официальный пакет `qwen-tts` модель Qwen3-TTS на этой видеокарте **медленнее реального
+времени**. Во время генерации GPU загружен примерно на 8%: узкое место — накладные расходы Python
+на каждом шаге генерации. Модель 0.6B не быстрее. Для живых ответов пока используйте Silero (или
+другой быстрый голос). Qwen3-TTS станет пригоден с более быстрым рантаймом, например vLLM-Omni
+или декодером на CUDA graphs; это в планах.
+
+ruaccent правильно ставит ударения в частых омографах («повесил зам+ок», «насыпь мук+у»). В
+неоднозначных фразах («замок на воротах сломан») он может ошибиться. Ударения ставятся на каждый
+кусок отдельно, так что модель видит меньше контекста, чем во всём ответе.
+
 ## Лицензии моделей
 
 Код в этом репозитории под Apache-2.0. **У моделей свои лицензии**, и вы принимаете их, когда
@@ -197,7 +227,7 @@ uv run pytest                    # все модели подменены: бе�
 
 ```powershell
 uv sync --all-extras
-uv pip install "gigaam @ git+https://github.com/salute-developers/GigaAM"
+uv pip install --no-deps "gigaam @ git+https://github.com/salute-developers/GigaAM"
 $env:PIPECAT_RU_GPU_TESTS = "1"
 $env:PIPECAT_RU_REF_AUDIO = "C:\voice\me.wav"         # по желанию, для клона голоса
 $env:PIPECAT_RU_REF_TEXT  = "Текст этой записи."
@@ -211,6 +241,6 @@ uv run pytest -m gpu -s
 
 * потоковое STT с промежуточными гипотезами (T-one или NVIDIA Nemotron streaming ASR), чтобы
   поддакивания и перебивания распознавались до конца фразы;
-* потоковый звук Qwen3-TTS, когда `qwen-tts` научится его отдавать.
+* рантайм Qwen3-TTS, работающий в реальном времени (vLLM-Omni или CUDA graphs), с потоковым звуком.
 
 См. [CONTRIBUTING.md](CONTRIBUTING.md) и [CHANGELOG.md](CHANGELOG.md).

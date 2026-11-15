@@ -4,7 +4,7 @@ Skipped unless ``PIPECAT_RU_GPU_TESTS=1``. They download the models on first run
 (GigaAM v3 ~1 GB, Qwen3-TTS 1.7B ~4 GB, Silero ~100 MB, ruaccent ~0.5 GB).
 
     uv sync --all-extras
-    uv pip install "gigaam @ git+https://github.com/salute-developers/GigaAM"
+    uv pip install --no-deps "gigaam @ git+https://github.com/salute-developers/GigaAM"
     $env:PIPECAT_RU_GPU_TESTS = "1"                     # PowerShell
     $env:PIPECAT_RU_REF_AUDIO = "C:\\voice\\me.wav"      # optional: your voice for cloning
     $env:PIPECAT_RU_REF_TEXT  = "Текст, который звучит в записи."

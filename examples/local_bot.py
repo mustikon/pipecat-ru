@@ -1,7 +1,7 @@
 """A Russian voice assistant on one PC: microphone -> GigaAM -> local LLM -> Qwen3-TTS.
 
     uv pip install "pipecat-ru[gigaam,qwen,silero]" "pipecat-ai[local]"
-    uv pip install "gigaam @ git+https://github.com/salute-developers/GigaAM"
+    uv pip install --no-deps "gigaam @ git+https://github.com/salute-developers/GigaAM"
     python examples/local_bot.py
 
 The LLM is any OpenAI-compatible server (vLLM, llama.cpp, LM Studio, Ollama):

@@ -7,7 +7,7 @@ punctuation and normalization, and unlike Whisper they do not hallucinate on sil
 Install::
 
     pip install "pipecat-ru[gigaam]"
-    pip install "gigaam @ git+https://github.com/salute-developers/GigaAM"
+    pip install --no-deps "gigaam @ git+https://github.com/salute-developers/GigaAM"
 
 The service is segmented: Pipecat's VAD cuts the user's speech into utterances and
 each utterance is transcribed in one call, on the GPU if there is one.
@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 import tempfile
 import time
@@ -51,29 +52,148 @@ class GigaAMSTTSettings(STTSettings):
     """
 
 
+# The official Hugging Face mirror of the checkpoints, used when SberDevices' CDN is
+# unreachable. Revisions are pinned to commits so the downloaded weights cannot change.
+HF_REPO = "ai-sage/GigaAM-v3"
+HF_REVISIONS: dict[str, str] = {
+    "v3_e2e_rnnt": "7655ad717f8122257385bb4b2f373db3697e8680",
+    "v3_e2e_ctc": "cec030b4c4f35d928e4a9044a3bdb29ebd499fac",
+    "v3_rnnt": "c7f128b8accdd9624df905e5c2d7b7a48c27c0d8",
+    "v3_ctc": "15ef3b5a88da78f93134b3cb7f015c70aefa8946",
+}
+_INSTALL_HINT = (
+    "Run:\n"
+    '  pip install "pipecat-ru[gigaam]"\n'
+    '  pip install --no-deps "gigaam @ git+https://github.com/salute-developers/GigaAM"'
+)
+
+
 def load_gigaam_model(
     model_name: str = DEFAULT_MODEL,
     *,
+    source: str = "auto",
     device: str | None = None,
     fp16_encoder: bool = True,
     use_flash: bool = False,
     download_root: str | None = None,
+    hf_revision: str | None = None,
 ) -> Any:
-    """Load a GigaAM model (downloads it on first use)."""
+    """Load a GigaAM model (downloads it on first use).
+
+    Args:
+        model_name: ``v3_e2e_rnnt``, ``v3_e2e_ctc``, ``v3_rnnt`` or ``v3_ctc``.
+        source: ``"package"``: the ``gigaam`` package and SberDevices' CDN;
+            ``"hf"``: the Hugging Face mirror (``ai-sage/GigaAM-v3``, pinned revision,
+            weights only: no remote code);
+            ``"auto"`` (default): the package, falling back to Hugging Face when the
+            package is missing or its download fails.
+        device: ``"cuda"``, ``"cpu"`` or None (GPU if available).
+        fp16_encoder: Run the encoder in fp16 on the GPU (package source).
+        use_flash: Use flash attention (package source; needs ``flash-attn``).
+        download_root: Checkpoint cache of the ``gigaam`` package.
+        hf_revision: Override the pinned Hugging Face revision.
+    """
+    if source not in ("auto", "package", "hf"):
+        raise ValueError(f"source must be 'auto', 'package' or 'hf', not {source!r}")
+    if source in ("auto", "package"):
+        try:
+            import gigaam
+        except ModuleNotFoundError as e:
+            if source == "package":
+                raise ImportError(f"GigaAM is not installed. {_INSTALL_HINT}") from e
+            logger.info("gigaam package not installed; loading GigaAM from Hugging Face")
+        else:
+            kwargs: dict[str, Any] = {"fp16_encoder": fp16_encoder, "use_flash": use_flash}
+            if device is not None:
+                kwargs["device"] = device
+            if download_root is not None:
+                kwargs["download_root"] = download_root
+            try:
+                return gigaam.load_model(model_name, **kwargs)
+            except (RuntimeError, OSError) as e:
+                # e.g. the CDN's TLS certificate expired (seen in November 2026)
+                if source == "package":
+                    raise
+                logger.warning(f"GigaAM download failed ({e}); trying Hugging Face {HF_REPO}")
+    return _load_from_hf(
+        model_name,
+        device=device,
+        revision=hf_revision,
+        fp16_encoder=fp16_encoder,
+        use_flash=use_flash,
+    )
+
+
+def _load_from_hf(
+    model_name: str,
+    *,
+    device: str | None,
+    revision: str | None,
+    fp16_encoder: bool = True,
+    use_flash: bool = False,
+) -> Any:
+    """Build a ``gigaam`` model from the Hugging Face mirror's weights.
+
+    Only data is downloaded (``config.json``, ``pytorch_model.bin``, ``tokenizer.model``
+    at a pinned commit); the repo's modeling code is not run. The config's
+    ``modeling_gigaam.*`` targets are mapped onto the ``gigaam`` package's classes.
+    """
+    if revision is None:
+        if model_name not in HF_REVISIONS:
+            raise ValueError(
+                f"No pinned Hugging Face revision for {model_name!r}; pass hf_revision="
+            )
+        revision = HF_REVISIONS[model_name]
     try:
-        import gigaam
+        import gigaam.decoder
+        import gigaam.decoding
+        import gigaam.encoder
+        import gigaam.preprocess
+        import torch
+        from gigaam.model import GigaAMASR
+        from huggingface_hub import hf_hub_download
+        from omegaconf import OmegaConf
     except ModuleNotFoundError as e:  # pragma: no cover - depends on extras
-        raise ImportError(
-            "GigaAM is not installed. Run:\n"
-            '  pip install "pipecat-ru[gigaam]" '
-            '"gigaam @ git+https://github.com/salute-developers/GigaAM"'
-        ) from e
-    kwargs: dict[str, Any] = {"fp16_encoder": fp16_encoder, "use_flash": use_flash}
-    if device is not None:
-        kwargs["device"] = device
-    if download_root is not None:
-        kwargs["download_root"] = download_root
-    return gigaam.load_model(model_name, **kwargs)
+        raise ImportError(f"GigaAM is not installed. {_INSTALL_HINT}") from e
+
+    def fetch(name: str) -> str:
+        return str(hf_hub_download(HF_REPO, name, revision=revision))
+
+    with open(fetch("config.json"), encoding="utf-8") as f:
+        cfg: dict[str, Any] = json.load(f)["cfg"]["model"]["cfg"]
+    modules = (gigaam.preprocess, gigaam.encoder, gigaam.decoder, gigaam.decoding)
+    _retarget(cfg, {m.__name__: m for m in modules})
+    if "decoding" in cfg and "model_path" in cfg["decoding"]:
+        cfg["decoding"]["model_path"] = fetch("tokenizer.model")
+    target = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    cfg.setdefault("encoder", {})["flash_attn"] = bool(use_flash) and target.type != "cpu"
+
+    model = GigaAMASR(OmegaConf.create(cfg))
+    state = torch.load(fetch("pytorch_model.bin"), map_location="cpu", weights_only=True)
+    prefix = "model."
+    state = {k.removeprefix(prefix): v for k, v in state.items()}
+    model.load_state_dict(state)
+    model = model.eval()
+    if fp16_encoder and target.type != "cpu":
+        model.encoder = model.encoder.half()
+    return model.to(target)
+
+
+def _retarget(node: Any, modules: dict[str, Any]) -> None:
+    """Point ``_target_: modeling_gigaam.X`` at the ``gigaam`` module defining X."""
+    if isinstance(node, dict):
+        target = node.get("_target_")
+        if isinstance(target, str) and target.startswith("modeling_gigaam."):
+            cls = target.split(".", 1)[1]
+            owner = next((name for name, m in modules.items() if hasattr(m, cls)), None)
+            if owner is None:
+                raise ValueError(f"gigaam package has no class {cls!r} for {target!r}")
+            node["_target_"] = f"{owner}.{cls}"
+        for value in node.values():
+            _retarget(value, modules)
+    elif isinstance(node, list):
+        for value in node:
+            _retarget(value, modules)
 
 
 def _result_text(result: Any) -> str:
@@ -94,7 +214,15 @@ class GigaAMTranscriber:
         """Wrap a loaded GigaAM model."""
         self.model = model
         self.max_segment_secs = max_segment_secs
-        self.fast_path = all(hasattr(model, a) for a in ("forward", "_decode", "_device"))
+        # The gigaam package decodes with model._decode(); the Hugging Face modeling
+        # code with model.decoding.decode(model.head, ...). Both take tensors.
+        self.fast_path = (
+            hasattr(model, "forward")
+            and hasattr(model, "_device")
+            and (
+                hasattr(model, "_decode") or (hasattr(model, "decoding") and hasattr(model, "head"))
+            )
+        )
 
     def transcribe(self, samples: FloatArray) -> str:
         """Transcribe mono float32 audio at 16 kHz; long audio is cut into pieces."""
@@ -119,7 +247,10 @@ class GigaAMTranscriber:
             wav = torch.from_numpy(samples).to(model._device).to(model._dtype).unsqueeze(0)
             length = torch.full([1], wav.shape[-1], device=model._device)
             encoded, encoded_len = model.forward(wav, length)
-            decoded = model._decode(encoded, encoded_len, length, False)[0]
+            if hasattr(model, "_decode"):
+                decoded = model._decode(encoded, encoded_len, length, False)[0]
+            else:
+                decoded = model.decoding.decode(model.head, encoded, encoded_len)[0]
         text = decoded[0] if isinstance(decoded, tuple | list) else decoded
         return _result_text(text)
 
@@ -143,6 +274,7 @@ class GigaAMSTTService(SegmentedSTTService):
         model: An already loaded GigaAM model (share one between services or
             inject a test double). When None, the model is loaded in a worker
             thread when the pipeline starts.
+        source: Where to load the checkpoint from (see :func:`load_gigaam_model`).
         device: ``"cuda"``, ``"cpu"`` or None for GigaAM's own choice.
         fp16_encoder: Run the encoder in fp16 on the GPU.
         use_flash: Use flash attention (needs ``flash-attn``).
@@ -159,6 +291,7 @@ class GigaAMSTTService(SegmentedSTTService):
         self,
         *,
         model: Any = None,
+        source: str = "auto",
         device: str | None = None,
         fp16_encoder: bool = True,
         use_flash: bool = False,
@@ -172,6 +305,7 @@ class GigaAMSTTService(SegmentedSTTService):
         if settings is not None:
             default_settings.apply_update(settings)
         super().__init__(settings=default_settings, **kwargs)
+        self._source = source
         self._gigaam_device = device
         self._fp16_encoder = fp16_encoder
         self._use_flash = use_flash
@@ -215,6 +349,7 @@ class GigaAMSTTService(SegmentedSTTService):
             model = await asyncio.to_thread(
                 load_gigaam_model,
                 model_name,
+                source=self._source,
                 device=self._gigaam_device,
                 fp16_encoder=self._fp16_encoder,
                 use_flash=self._use_flash,

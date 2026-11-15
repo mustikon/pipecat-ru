@@ -33,9 +33,20 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# GigaAM v3 is not on PyPI (the `gigaam` name there is an old v1 build). Install it
-# from GitHub on top of this extra; see the README.
-gigaam = ["torch>=2.5"]
+# GigaAM v3 is not on PyPI (the `gigaam` name there is an old v1 build), and its
+# onnxruntime==1.23.* pin clashes with pipecat-ai's onnxruntime>=1.24.3 (GigaAM only
+# needs onnxruntime for ONNX export). So this extra carries GigaAM's runtime deps and
+# GigaAM itself is installed from GitHub with --no-deps; see the README.
+gigaam = [
+    "torch>=2.6",
+    "torchaudio>=2.6",
+    "hydra-core>=1.3,<1.4",
+    "omegaconf>=2.3,<2.4",
+    "sentencepiece",
+    "tqdm",
+    # for the Hugging Face fallback (ai-sage/GigaAM-v3)
+    "huggingface-hub>=0.24",
+]
 qwen = ["qwen-tts>=0.1.1", "torch>=2.5"]
 silero = ["silero>=0.5.5", "torch>=2.5"]
 accent = ["ruaccent>=1.5.8"]
@@ -102,5 +113,5 @@ files = ["src", "examples"]
 untyped_calls_exclude = ["pipecat"]
 
 [[tool.mypy.overrides]]
-module = ["torch.*", "gigaam.*", "qwen_tts.*", "silero.*", "ruaccent.*", "rutextnorm.*", "soundfile.*"]
+module = ["torch.*", "huggingface_hub.*", "omegaconf.*", "gigaam.*", "qwen_tts.*", "silero.*", "ruaccent.*", "rutextnorm.*", "soundfile.*"]
 ignore_missing_imports = true
